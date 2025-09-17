@@ -195,12 +195,12 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
             
             # Handle keepdims for axis=None case
             if keepdims:
-                # Need to wrap in appropriate number of dimensions
-                while x.ndim > 0:
-                    out = ak.unflatten(out, 1, axis=0)
-                    x = x[0:0]  # Remove one dimension
+                # Wrap in singleton dimensions to match original shape
+                for _ in range(x.ndim):
+                    out = ak.unflatten([out], 1, axis=0)[0]
                     
-        else:
+        elif axis == x.ndim - 1 or axis == -1:
+            # For the innermost axis (within each list), use jpivarski's approach
             # Sort along the specified axis
             sorted_array = ak.sort(x, axis=axis)
             
@@ -228,15 +228,38 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
             
             # Extract scalars from length-1 lists
             out = median_values[:, 0]
+            
+        else:
+            # For other axes (like axis=0), we need to use a different approach
+            # that works across lists rather than within lists
+            
+            # This is more complex - we need to compute median across the specified axis
+            # For now, let's fall back to using numpy's median on the appropriate slices
+            # This is a simplified implementation that may not handle all edge cases
+            
+            # Convert to numpy array if possible for cross-axis operations
+            try:
+                # Try to convert to regular array
+                regular = ak.to_regular(x)
+                np_array = ak.to_numpy(regular)
+                np_result = numpy.median(np_array, axis=axis, keepdims=keepdims)
+                out = ak.from_numpy(np_result)
+            except:
+                # If conversion fails, we need a more complex approach
+                # For now, raise a helpful error
+                raise NotImplementedError(
+                    f"Median along axis={axis} for irregular arrays is not yet implemented. "
+                    f"Only axis=None (all elements) and axis={x.ndim-1} (innermost axis) are supported."
+                )
 
-        if not mask_identity:
+        if not mask_identity and axis is not None:
             out = ak.fill_none(out, numpy.nan, axis=-1)
 
-        if axis is not None and not keepdims:
-            # For specific axis, result already has reduced dimension
+        if axis is not None and not keepdims and axis != x.ndim - 1 and axis != -1:
+            # For axis=0 case, keepdims handling is done in numpy.median call above
             pass
-        elif axis is not None and keepdims:
-            # Add back the reduced dimension
+        elif axis is not None and keepdims and (axis == x.ndim - 1 or axis == -1):
+            # For innermost axis, add back the reduced dimension
             out = ak.unflatten(out, 1, axis=axis)
 
         wrapped = ctx.without_attr(NAMED_AXIS_KEY).wrap(
