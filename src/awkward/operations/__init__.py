@@ -62,6 +62,7 @@ from awkward.operations.ak_mask import *
 from awkward.operations.ak_materialize import *
 from awkward.operations.ak_max import *
 from awkward.operations.ak_mean import *
+from awkward.operations.ak_median import *
 from awkward.operations.ak_merge_option_of_records import *
 from awkward.operations.ak_merge_union_of_records import *
 from awkward.operations.ak_metadata_from_parquet import *
