@@ -229,6 +229,11 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
             # Extract scalars from length-1 lists
             out = median_values[:, 0]
             
+            # Handle keepdims for innermost axis
+            if keepdims:
+                # Wrap each result in a length-1 sublist to restore the dimension
+                out = ak.singletons(out)
+            
         else:
             # For other axes (like axis=0), we need to use a different approach
             # that works across lists rather than within lists
@@ -255,13 +260,8 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
         if not mask_identity and axis is not None:
             out = ak.fill_none(out, numpy.nan, axis=-1)
 
-        if axis is not None and not keepdims and axis != x.ndim - 1 and axis != -1:
-            # For axis=0 case, keepdims handling is done in numpy.median call above
-            pass
-        elif axis is not None and keepdims and (axis == x.ndim - 1 or axis == -1):
-            # For innermost axis, add back the reduced dimension
-            out = ak.unflatten(out, 1, axis=axis)
-
+        # keepdims is already handled in the individual axis cases above
+        
         wrapped = ctx.without_attr(NAMED_AXIS_KEY).wrap(
             maybe_highlevel_to_lowlevel(out),
             highlevel=highlevel,
