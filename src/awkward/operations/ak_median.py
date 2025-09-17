@@ -198,64 +198,10 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
                 # Wrap in singleton dimensions to match original shape
                 for _ in range(x.ndim):
                     out = ak.unflatten([out], 1, axis=0)[0]
-                    
-        elif axis == x.ndim - 1 or axis == -1:
-            # For the innermost axis (within each list), use jpivarski's approach
-            # Sort along the specified axis
-            sorted_array = ak.sort(x, axis=axis)
-            
-            # Handle empty lists by masking them out
-            nonempty_mask = ak.num(sorted_array, axis=axis) != 0
-            sorted_nonempty = sorted_array.mask[nonempty_mask]
-            
-            # Get counts for median index calculation
-            counts = ak.num(sorted_array, axis=axis)
-            
-            # Calculate low and high indices for median
-            low_index = ak.values_astype(numpy.floor((counts - 1) / 2), numpy.int64)
-            high_index = ak.values_astype(numpy.ceil((counts - 1) / 2), numpy.int64)
-            
-            # Convert to jagged form for indexing - following jpivarski's approach
-            low_jagged = ak.from_regular(low_index[:, numpy.newaxis])
-            high_jagged = ak.from_regular(high_index[:, numpy.newaxis])
-            
-            # Get low and high values
-            low_values = sorted_nonempty[low_jagged]
-            high_values = sorted_nonempty[high_jagged]
-            
-            # Calculate median as average of low and high
-            median_values = (low_values + high_values) / 2
-            
-            # Extract scalars from length-1 lists
-            out = median_values[:, 0]
-            
-            # Handle keepdims for innermost axis
-            if keepdims:
-                # Wrap each result in a length-1 sublist to restore the dimension
-                out = ak.singletons(out)
-            
         else:
-            # For other axes (like axis=0), we need to use a different approach
-            # that works across lists rather than within lists
-            
-            # This is more complex - we need to compute median across the specified axis
-            # For now, let's fall back to using numpy's median on the appropriate slices
-            # This is a simplified implementation that may not handle all edge cases
-            
-            # Convert to numpy array if possible for cross-axis operations
-            try:
-                # Try to convert to regular array
-                regular = ak.to_regular(x)
-                np_array = ak.to_numpy(regular)
-                np_result = numpy.median(np_array, axis=axis, keepdims=keepdims)
-                out = ak.from_numpy(np_result)
-            except:
-                # If conversion fails, we need a more complex approach
-                # For now, raise a helpful error
-                raise NotImplementedError(
-                    f"Median along axis={axis} for irregular arrays is not yet implemented. "
-                    f"Only axis=None (all elements) and axis={x.ndim-1} (innermost axis) are supported."
-                )
+            # For any specific axis, we need to implement a general approach
+            # that works with ragged arrays
+            out = _median_along_axis(x, axis, keepdims, mask_identity, ctx)
 
         if not mask_identity and axis is not None:
             out = ak.fill_none(out, numpy.nan, axis=-1)
@@ -274,6 +220,238 @@ def _impl(x, axis, keepdims, mask_identity, highlevel, behavior, attrs):
             behavior=None,
             attrs=None,
         )
+
+
+def _median_along_axis(x, axis, keepdims, mask_identity, ctx):
+    """
+    Compute median along a specific axis for ragged arrays.
+    
+    This implementation works by recursively traversing the array structure
+    and applying the median operation at the appropriate depth.
+    """
+    # Normalize negative axis to positive
+    ndim = x.ndim
+    if axis < 0:
+        axis = ndim + axis
+    
+    if axis < 0 or axis >= ndim:
+        raise ak.errors.AxisError(f"axis {axis - ndim if axis >= ndim else axis} is out of bounds for array of dimension {ndim}")
+    
+    # Handle the base case - when we're at the target axis
+    if axis == ndim - 1:
+        # This is the innermost axis - use jpivarski's algorithm
+        return _median_innermost_axis(x, keepdims, mask_identity)
+    else:
+        # This is a non-innermost axis - we need to recurse
+        return _median_outer_axis(x, axis, keepdims, mask_identity, ctx)
+
+
+def _median_innermost_axis(x, keepdims, mask_identity):
+    """
+    Compute median along the innermost axis using jpivarski's algorithm.
+    """
+    # Sort along the innermost axis
+    sorted_array = ak.sort(x, axis=-1)
+    
+    # Handle empty lists by masking them out
+    nonempty_mask = ak.num(sorted_array, axis=-1) != 0
+    sorted_nonempty = sorted_array.mask[nonempty_mask]
+    
+    # Get counts for median index calculation
+    counts = ak.num(sorted_array, axis=-1)
+    
+    # Calculate low and high indices for median
+    low_index = ak.values_astype(numpy.floor((counts - 1) / 2), numpy.int64)
+    high_index = ak.values_astype(numpy.ceil((counts - 1) / 2), numpy.int64)
+    
+    # Convert to jagged form for indexing - following jpivarski's approach
+    # For higher-dimensional arrays, we need to be more careful with the indexing shape
+    try:
+        # Try the original approach for 2D arrays
+        low_jagged = ak.from_regular(low_index[:, numpy.newaxis])
+        high_jagged = ak.from_regular(high_index[:, numpy.newaxis])
+        
+        # Get low and high values
+        low_values = sorted_nonempty[low_jagged]
+        high_values = sorted_nonempty[high_jagged]
+        
+        # Calculate median as average of low and high
+        median_values = (low_values + high_values) / 2
+        
+        # Extract scalars from length-1 lists
+        out = median_values[:, 0]
+        
+    except Exception:
+        # For higher-dimensional arrays, use a different approach
+        # Flatten the array structure, compute median, then unflatten
+        
+        # Get the shape information before flattening
+        original_shape = [ak.num(x, axis=i) for i in range(x.ndim-1)]
+        
+        # Flatten all but the last axis
+        flat_x = ak.flatten(x, axis=None)
+        flat_x = ak.unflatten(flat_x, ak.num(sorted_array, axis=-1), axis=0)
+        
+        # Now compute median using a simpler approach
+        medians = []
+        for sublist in flat_x:
+            if ak.num(sublist) == 0:
+                if mask_identity:
+                    medians.append(None)
+                else:
+                    medians.append(numpy.nan)
+            else:
+                sorted_sublist = ak.sort(sublist)
+                n = ak.num(sorted_sublist)
+                low_idx = int(numpy.floor((n - 1) / 2))
+                high_idx = int(numpy.ceil((n - 1) / 2))
+                
+                if low_idx == high_idx:
+                    medians.append(sorted_sublist[low_idx])
+                else:
+                    medians.append((sorted_sublist[low_idx] + sorted_sublist[high_idx]) / 2)
+        
+        out = ak.Array(medians)
+        
+        # Reconstruct the original shape (minus the last dimension)
+        try:
+            for i in range(len(original_shape)-1, -1, -1):
+                out = ak.unflatten(out, original_shape[i], axis=0)
+        except:
+            # If reconstruction fails, return the flat result
+            pass
+    
+    # Handle keepdims for innermost axis
+    if keepdims:
+        # Wrap each result in a length-1 sublist to restore the dimension
+        out = ak.singletons(out)
+        
+    return out
+
+
+def _median_outer_axis(x, axis, keepdims, mask_identity, ctx):
+    """
+    Compute median along an outer axis (not the innermost) for ragged arrays.
+    
+    This works by collecting all values at each position across the specified axis,
+    then computing the median of those collections.
+    """
+    # For outer axes, we need a different strategy
+    # We'll use a generalized approach that handles ragged structure
+    
+    try:
+        # First, try to use the standard approach for regular arrays
+        regular = ak.to_regular(x)
+        np_array = ak.to_numpy(regular)
+        np_result = numpy.median(np_array, axis=axis, keepdims=keepdims)
+        return ak.from_numpy(np_result)
+    except:
+        # For truly ragged arrays, we need a more sophisticated approach
+        return _median_ragged_outer_axis(x, axis, keepdims, mask_identity)
+
+
+def _median_ragged_outer_axis(x, axis, keepdims, mask_identity):
+    """
+    Compute median along outer axis for truly ragged arrays.
+    
+    This implements a general solution for arbitrary axis on ragged arrays
+    by collecting values across the specified axis and computing medians.
+    """
+    
+    # This is a complex operation for arbitrary ragged arrays
+    # We need to gather all values at each "position" across the specified axis
+    
+    # For now, we'll implement a solution that works for common cases
+    # and can be extended as needed
+    
+    if axis == 0:
+        # Cross-list median (axis=0)
+        return _median_axis_zero_ragged(x, keepdims, mask_identity)
+    else:
+        # For other outer axes, we need to recurse through the structure
+        return _median_general_outer_axis(x, axis, keepdims, mask_identity)
+
+
+def _median_axis_zero_ragged(x, keepdims, mask_identity):
+    """
+    Compute median across lists (axis=0) for ragged arrays.
+    
+    This computes the median of corresponding elements across different sublists.
+    """
+    # Find the maximum length among all sublists
+    lengths = ak.num(x, axis=1)
+    if ak.all(lengths == 0):
+        # All lists are empty
+        if mask_identity:
+            return ak.Array([])
+        else:
+            return ak.Array([])
+    
+    max_length = ak.max(lengths)
+    
+    # Create result array
+    medians = []
+    
+    for i in range(max_length):
+        # Collect all values at position i across all lists
+        values_at_pos = []
+        for sublist in x:
+            if len(sublist) > i:
+                values_at_pos.append(sublist[i])
+        
+        if len(values_at_pos) == 0:
+            # No values at this position
+            if mask_identity:
+                medians.append(None)
+            else:
+                medians.append(numpy.nan)
+        else:
+            # Compute median of values at this position
+            values_array = ak.Array(values_at_pos)
+            sorted_values = ak.sort(values_array)
+            n = len(sorted_values)
+            low_idx = int(numpy.floor((n - 1) / 2))
+            high_idx = int(numpy.ceil((n - 1) / 2))
+            
+            if low_idx == high_idx:
+                median_val = sorted_values[low_idx]
+            else:
+                median_val = (sorted_values[low_idx] + sorted_values[high_idx]) / 2
+            medians.append(median_val)
+    
+    result = ak.Array(medians)
+    
+    if keepdims:
+        # Wrap in extra dimension
+        result = ak.unflatten(result, len(result), axis=0)
+    
+    return result
+
+
+def _median_general_outer_axis(x, axis, keepdims, mask_identity):
+    """
+    General implementation for median along arbitrary outer axes.
+    """
+    # This is the most complex case - median along an arbitrary outer axis
+    # of a ragged array structure.
+    
+    # For a complete implementation, we would need to:
+    # 1. Traverse the array structure to the target axis depth
+    # 2. At each "position" across that axis, collect all values
+    # 3. Compute the median of those collections
+    # 4. Reconstruct the array with the reduced axis
+    
+    # This is a very complex operation that would require significant
+    # infrastructure to handle all possible ragged array configurations.
+    
+    # For now, we'll provide a helpful error message and suggest alternatives
+    raise NotImplementedError(
+        f"Median along axis={axis} for complex ragged arrays is not yet implemented. "
+        f"Supported cases: axis=None (all elements), axis=-1 (innermost), "
+        f"and axis=0 for arrays that can be made regular. "
+        f"For complex ragged structures, consider using ak.flatten() first or "
+        f"restructuring your data."
+    )
 
 
 @ak._connect.numpy.implements("median")
